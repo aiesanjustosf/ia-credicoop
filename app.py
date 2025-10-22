@@ -4,26 +4,32 @@ import numpy as np
 import pdfplumber
 import io
 import re
-import os # Aunque no se usa para temp files, lo mantenemos por si acaso
 
 # ----------------------------------------------------------------------
-# 1. FUNCIÓN DE EXTRACCIÓN Y LIMPIEZA CON PDFPLUMBER (ONLINE COMPATIBLE)
+# 1. FUNCIÓN DE EXTRACCIÓN Y LIMPIEZA CON PDFPLUMBER (MODO STREAM)
 # ----------------------------------------------------------------------
 
 def extract_tables_from_pdf(uploaded_file):
     """
-    Extrae tablas de movimientos del PDF usando pdfplumber.
-    Esta función es puramente Python y funciona en Streamlit Cloud.
+    Extrae tablas de movimientos del PDF usando pdfplumber en modo 'stream' 
+    para mejor manejo de formatos complejos (como los del Credicoop).
     """
-    
     pdf_bytes = uploaded_file.read()
     all_data = []
 
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for page in pdf.pages:
-                # Usar extract_tables() con la configuración predeterminada (lattice mode)
-                tables = page.extract_tables()
+                # Usamos el modo 'stream' en lugar de 'lattice' para una detección más flexible.
+                settings = {
+                    "vertical_strategy": "lines", # Líneas verticales rígidas
+                    "horizontal_strategy": "lines", # Líneas horizontales rígidas
+                    "snap_tolerance": 3,
+                    "min_words_vertical": 2, # Ayuda a que DESCRIPCION no se divida.
+                    "text_only": False,
+                    "keep_blank_chars": True
+                }
+                tables = page.extract_tables(table_settings=settings)
                 
                 if tables:
                     for table in tables:
@@ -31,98 +37,93 @@ def extract_tables_from_pdf(uploaded_file):
                             all_data.extend(table)
         
         if not all_data:
-            st.error("No se pudieron extraer datos de tablas del PDF. Verifica el formato.")
+            st.error("No se pudieron extraer datos de tablas del PDF. Asegúrate de que contenga tablas de movimientos.")
             return None
 
+        # Consolidar los datos extraídos en un DataFrame
         df = pd.DataFrame(all_data)
-
-        # 1. Buscar la fila de encabezado
-        header_index = None
-        target_cols = ['FECHA', 'DESCRIPCION', 'DEBITO', 'CREDITO', 'SALDO']
-
-        for i, row in df.iterrows():
-            row_str = " ".join(str(x).upper() for x in row.dropna().astype(str))
-            if any(col in row_str for col in ['DESCRIPCION', 'DEBITO', 'CREDITO', 'SALDO']):
-                header_index = i
-                break
-
-        if header_index is None:
-            st.error("No se pudo identificar la fila de encabezado (FECHA, DESCRIPCION, etc.).")
-            return None
-
-        # 2. Asignar la fila de encabezado y limpiar
-        df.columns = df.iloc[header_index]
-        df = df.iloc[header_index + 1:].reset_index(drop=True)
-
-        # 3. Normalizar columnas: Se espera (FECHA, COMBTE, DESCRIPCION, DEBITO, CREDITO, SALDO)
-        # Se renombra para mantener solo las 5 columnas clave:
         
-        # Primero, eliminamos las columnas que sean todas nulas o vacías.
-        df.dropna(axis=1, how='all', inplace=True) 
-
-        # Si hay 6 columnas (FECHA, COMBTE, DESCRIPCION, DEBITO, CREDITO, SALDO)
-        if df.shape[1] == 6:
-            df.columns = ['FECHA', 'COMBTE', 'DESCRIPCION', 'DEBITO', 'CREDITO', 'SALDO']
-            df = df[['FECHA', 'DESCRIPCION', 'DEBITO', 'CREDITO', 'SALDO']] # Elimina COMBTE
-        # Si hay 5 columnas
-        elif df.shape[1] == 5:
-            df.columns = target_cols
-        else:
-            st.warning(f"La tabla extraída tiene {df.shape[1]} columnas, se esperaban 5 o 6. Se intenta forzar el formato.")
-            df = df.iloc[:, :5]
-            df.columns = target_cols
-            
-        # 4. Consolidar filas parciales (para descripciones multi-línea)
-        df['FECHA'] = df['FECHA'].fillna(method='ffill')
-        # Limpiamos los movimientos que son solo parte de una descripción
-        df.dropna(subset=['FECHA'], inplace=True)
+        # Filtrar filas completamente vacías
+        df.dropna(how='all', inplace=True)
         
-        df_final = []
-        current_row = {}
+        # Eliminar las filas que probablemente son encabezados repetidos
+        df = df[~df.iloc[:, 0].astype(str).str.contains(r'FECHA|SALDO|TOTALES', na=False)]
+
+        # 2. Reestructuración de Columnas para el formato Credicoop
+        # El PDF de Credicoop a menudo tiene 6 columnas (FECHA, COMBTE, DESCRIPCION, DEBITO, CREDITO, SALDO)
+        # o más si las descripciones se dividen.
+        
+        # Tomamos solo las primeras 6 columnas si existen, o rellenamos con NaN si no.
+        max_cols = 6
+        if df.shape[1] < max_cols:
+            df = df.reindex(columns=range(max_cols))
+        elif df.shape[1] > max_cols:
+             df = df.iloc[:, :max_cols] # Cortamos columnas excedentes
+             
+        df.columns = ['FECHA', 'COMBTE', 'DESCRIPCION', 'DEBITO', 'CREDITO', 'SALDO']
+        
+        # La limpieza de continuación de filas es la más crítica:
+        df_processed = []
+        current_row = None
         for _, row in df.iterrows():
             
-            # Condición para identificar una fila de continuación (no tiene valores numéricos)
-            is_continuation_row = (pd.isna(row['DEBITO']) or str(row['DEBITO']).strip() in ['', 'None']) and \
-                                  (pd.isna(row['CREDITO']) or str(row['CREDITO']).strip() in ['', 'None']) and \
-                                  (pd.isna(row['SALDO']) or str(row['SALDO']).strip() in ['', 'None']) and \
-                                  (row['DESCRIPCION'] is not None)
-
-            if not is_continuation_row:
-                if current_row: 
-                    df_final.append(current_row)
-                current_row = row.to_dict()
-                
-            elif current_row:
-                 # Añadir la descripción a la fila principal
-                current_row['DESCRIPCION'] = str(current_row.get('DESCRIPCION', '')) + " " + str(row['DESCRIPCION'])
+            # Limpiamos NaN a strings vacíos para facilitar las condiciones
+            row_dict = row.astype(str).replace({'nan': '', 'None': ''}).to_dict()
             
-            elif not current_row and row['FECHA']: # Caso de la primera fila (SALDO ANTERIOR)
-                 current_row = row.to_dict()
+            # Condición para identificar un nuevo movimiento (debe tener FECHA o ser SALDO ANTERIOR)
+            is_new_movement = (row_dict['FECHA'] != '') or ('SALDO ANTERIOR' in row_dict['DESCRIPCION'].upper())
+            
+            # Condición para identificar una fila de continuación (no tiene valores numéricos en Débito/Crédito/Saldo)
+            is_continuation_row = (row_dict['DEBITO'].strip() == '') and \
+                                  (row_dict['CREDITO'].strip() == '') and \
+                                  (row_dict['SALDO'].strip() == '') and \
+                                  (row_dict['DESCRIPCION'].strip() != '')
 
-        if current_row:
-            df_final.append(current_row)
+            if is_new_movement and not is_continuation_row:
+                # Iniciar un nuevo movimiento
+                if current_row is not None:
+                    df_processed.append(current_row)
+                current_row = row_dict
+                
+            elif is_continuation_row and current_row is not None:
+                # Añadir la descripción a la fila principal
+                current_row['DESCRIPCION'] = current_row['DESCRIPCION'] + " " + row_dict['DESCRIPCION']
+            
+            elif is_new_movement and is_continuation_row:
+                 # Caso de fila inicial mal formateada o SALDO ANTERIOR.
+                 if current_row is not None:
+                    df_processed.append(current_row)
+                 current_row = row_dict
+                 
+        if current_row is not None:
+            df_processed.append(current_row)
 
-        df_processed = pd.DataFrame(df_final)
-        df_processed.dropna(subset=['DESCRIPCION'], inplace=True)
+        df_final = pd.DataFrame(df_processed)
+        df_final.dropna(subset=['DESCRIPCION'], inplace=True)
         
-        return df_processed.drop_duplicates().reset_index(drop=True)
+        # Finalmente, eliminamos la columna COMBTE y forzamos las 5 columnas requeridas
+        if 'COMBTE' in df_final.columns:
+            df_final = df_final.drop(columns=['COMBTE'])
+            
+        return df_final[['FECHA', 'DESCRIPCION', 'DEBITO', 'CREDITO', 'SALDO']].drop_duplicates().reset_index(drop=True)
 
     except Exception as e:
-        st.error(f"Error en la extracción de PDF: {e}")
+        st.error(f"Error en la extracción de PDF con pdfplumber: {e}")
         return None
 
 # ----------------------------------------------------------------------
-# FUNCIONES DE LIMPIEZA Y ANÁLISIS
+# FUNCIONES DE LIMPIEZA Y ANÁLISIS (Se mantienen robustas)
 # ----------------------------------------------------------------------
 
 def limpiar_y_transformar_df(df):
     """Limpia los datos, convierte formatos y calcula el NETO."""
 
     required_cols = ['FECHA', 'DESCRIPCION', 'DEBITO', 'CREDITO', 'SALDO']
-    df.columns = required_cols # Las forzamos a los nombres estándar
+    df.columns = required_cols 
 
     def limpiar_y_convertir_numerico(series):
         # Limpia miles (punto) y convierte la coma en punto decimal.
+        # Esto maneja el formato del Credicoop: 1.000,00 -> 1000.00
         series = series.astype(str).str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
         return pd.to_numeric(series, errors='coerce').fillna(0)
 
@@ -158,7 +159,7 @@ def categorizar_movimiento(descripcion, debito, credito):
             return 'Impuesto - IVA / Percepciones'
         elif 'PAGO DE CHEQUE' in desc or 'COMISION CHEQUE PAGADO' in desc:
             return 'Gasto - Cheques y Comisiones'
-        elif 'TRANSFER.' in desc and ('DISTINTO TITULAR' in desc or 'O/BCO' in desc or '27326211740-1 M PIANETTI' in desc):
+        elif 'TRANSFER.' in desc and ('DISTINTO TITULAR' in desc or 'O/BCO' in desc or 'PIANETTI' in desc):
             return 'Gasto - Transferencia Pagada a Terceros'
         elif 'TRANSF.' in desc and 'IGUAL TITULAR' in desc:
             return 'Transferencia Interna (Egreso)'
@@ -184,7 +185,6 @@ def categorizar_movimiento(descripcion, debito, credito):
             
     return 'Otros/Movimiento no categorizado'
 
-
 def analizar_movimientos(df):
     """Aplica la categorización y realiza el cálculo de saldo."""
     
@@ -207,7 +207,7 @@ def analizar_movimientos(df):
 
 st.set_page_config(layout="wide")
 st.title("🏦 Analizador y Conciliador Bancario Credicoop (Versión 100% Online)")
-st.markdown("Sube tu resumen de cuenta en formato **PDF** para extraer y categorizar automáticamente los movimientos. **No requiere Java ni instalación local.**")
+st.markdown("Sube tu resumen de cuenta en formato **PDF** para extraer y categorizar automáticamente los movimientos.")
 st.markdown("---")
 
 uploaded_file = st.file_uploader("Sube tu archivo PDF de movimientos bancarios", type=['pdf'])
@@ -257,14 +257,12 @@ if uploaded_file is not None:
                 with col4:
                     st.subheader("Ingresos Totales (Créditos)")
                     st.table(ingresos.apply(lambda x: f"${x:,.2f}").reset_index(name='Total Neto'))
+                    st.markdown(f"**Total Ingresos Netos: ${ingresos.sum():,.2f}**")
 
                 with col5:
                     st.subheader("Gastos y Débitos (Débitos)")
-                    # LÍNEA CORREGIDA (SOLUCIÓN AL SYNTAX ERROR)
                     st.table(gastos.apply(lambda x: f"${x:,.2f}").reset_index(name='Total Neto')) 
-                    
-                st.markdown(f"**Total Ingresos Netos: ${ingresos.sum():,.2f}**")
-                st.markdown(f"**Total Gastos Netos: ${gastos.sum():,.2f}**") # Mantenemos el total aquí para mejor visualización
+                    st.markdown(f"**Total Gastos Netos: ${gastos.sum():,.2f}**")
 
                 st.markdown("---")
                 st.header("3. Detalle Completo de Movimientos y Saldo Recalculado")
@@ -282,10 +280,10 @@ if uploaded_file is not None:
 
         except Exception as e:
             st.error(f"Error crítico durante el análisis: {e}")
-            st.warning("Verifica el log de Streamlit Cloud para más detalles. Si hay un error en la columna `FECHA` o `SALDO`, puede ser un problema de extracción.")
+            st.warning("Revisa el log de Streamlit Cloud. El error puede estar en la conversión de `FECHA` o en las columnas numéricas.")
             
     else:
-        st.error("La extracción con PDFPlumber falló o no encontró datos tabulares. Intenta subir un archivo PDF con buena calidad de tabla.")
+        st.error("La extracción con PDFPlumber falló. Intenta subir un archivo PDF con buena calidad de tabla. Si el problema persiste, la estructura del PDF requiere una herramienta más avanzada (como Tabula/Java).")
 
 
 else:
