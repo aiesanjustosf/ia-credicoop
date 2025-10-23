@@ -44,7 +44,7 @@ DATE_CHARS = re.compile(r"^[0-9/]+$")
 def parse_money_es(s: str) -> Decimal:
     s = (s or "").strip()
     neg = False
-    if s.startswith("(") and s.endswith(")")):
+    if s.startswith("(") and s.endswith(")"):
         neg = True; s = s[1:-1]
     s = s.replace("$","").strip()
     for ch in ["\u00A0","\u202F","\u2007"," "]:
