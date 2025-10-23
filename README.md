@@ -1,9 +1,8 @@
 
-# Extractor Credicoop Online — v2
+# Extractor Credicoop Online — v3.2 (grandes montos)
 
-- Estrategia automática (texto por palabras, líneas, tablas, y OCR como último recurso).
-- Clasificación de columnas por **1D k-means** (evita poner todo como "crédito").
-- Conciliación y exportación a Excel.
+- Decimal en parsing; export seguro para montos grandes.
+- Hojas Excel: Movimientos (num + string + centavos) y Resumen (incluye *_centavos).
 
 ## Deploy
-- **Streamlit Cloud** o **Hugging Face Spaces**. Subí `app_credicoop.py`, `requirements.txt`, `packages.txt`.
+- Streamlit Cloud o Hugging Face Spaces (subí `app_credicoop.py`, `requirements.txt`, `packages.txt`).
