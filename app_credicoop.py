@@ -1,8 +1,9 @@
 
-# app_credicoop.py (v3.2) — grandes montos: export seguro
-# - Alineación fija (izq=Débito, medio=Crédito, der=Saldo)
-# - Parser usa Decimal (precisión arbitraria)
-# - Excel exporta numérico + string exacto + centavos (int)
+# app_credicoop.py (v3.3) — detección robusta de montos + alineación fija + debug
+# - Izq=Débito, Medio=Crédito, Der=Saldo
+# - Montos robustos: admite NBSP/thin spaces, tokens partidos, paréntesis (negativos), $
+# - Reconstruye montos a nivel de fila (merge tokens contiguos de dígitos/separadores)
+# - Debug mode para ver centroids y ejemplos
 
 import io, re, os
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -24,23 +25,35 @@ try:
 except Exception:
     OCR_AVAILABLE = False
 
-st.set_page_config(page_title="Extractor Credicoop Online — v3.2", page_icon="📄")
-st.title("📄 Extractor Credicoop Online — v3.2 (grandes montos)")
-st.caption("Alineación fija. Montos en Decimal. Export a Excel: numérico + string exacto + centavos.")
+st.set_page_config(page_title="Extractor Credicoop Online — v3.3", page_icon="📄")
+st.title("📄 Extractor Credicoop Online — v3.3 (montos robustos + debug)")
+st.caption("Alineación fija (Débito/Crédito/Saldo). Montos robustos con tokens partidos y espacios finos.")
 
-MONEY_RE = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}")
+DEBUG = st.checkbox("Modo debug", value=False, help="Muestra centroids, ejemplos de montos y primeras líneas.")
+
+# Separadores posibles: punto, espacio, NBSP, thin space, figure space
+SEP_CHARS = r"\.\u00A0\u202F\u2007 "  # .  NBSP  NARROW_NBSP  FIGURE_SPACE  space
+ALLOWED_IN_AMOUNT = re.compile(rf"^[\d,{SEP_CHARS}\(\)\-\$]+$")
+MONEY_RE = re.compile(rf"^\(?\$?\s*\d{{1,3}}(?:[{SEP_CHARS}]\d{{3}})*,\d{{2}}\)?$")
 DATE_RES = [re.compile(r"^\d{2}/\d{2}/\d{2}$"), re.compile(r"^\d{2}/\d{2}/\d{4}$")]
 
 def parse_money_es(s: str) -> Decimal:
     s = (s or "").strip()
-    if s == "":
-        return Decimal("0")
+    neg = False
+    if s.startswith("(") and s.endswith(")"):
+        neg = True
+        s = s[1:-1]
+    s = s.replace("$","").strip()
+    # normalizar separadores
+    for ch in ["\u00A0","\u202F","\u2007"," "]:
+        s = s.replace(ch, "")
     s = s.replace(".", "").replace(",", ".")
     try:
         d = Decimal(s)
     except InvalidOperation:
         return Decimal("0")
-    # normalizar a 2 decimales por seguridad
+    if neg:
+        d = -d
     return d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 def is_date_token(tok: str) -> bool:
@@ -119,13 +132,46 @@ def extract_words_ocr(pdf_bytes, dpi=300, lang="spa"):
         pages_lines.append(lines)
     return pages_words, pages_lines
 
+def detect_amount_runs(row_sorted, max_gap=12.0):
+    """Une tokens contiguos que parezcan parte de un monto (solo dígitos y separadores)."""
+    runs = []
+    current = []
+    last_x1 = None
+    for w in row_sorted:
+        t = w["text"]
+        if ALLOWED_IN_AMOUNT.match(t):
+            if last_x1 is None or (w["x0"] - last_x1) <= max_gap:
+                current.append(w); last_x1 = w["x1"]
+            else:
+                runs.append(current); current = [w]; last_x1 = w["x1"]
+        else:
+            if current:
+                runs.append(current); current = []; last_x1 = None
+    if current:
+        runs.append(current)
+    # Convert to string and bbox
+    assembled = []
+    for run in runs:
+        text = "".join(w["text"] for w in run).strip()
+        x0 = min(w["x0"] for w in run); x1 = max(w["x1"] for w in run)
+        assembled.append({"text": text, "x0": x0, "x1": x1, "top": min(w["top"] for w in run), "bottom": max(w["bottom"] for w in run)})
+    return assembled
+
 def detect_columns_fixed(pages_words):
     all_x = []
+    examples = []
     for words in pages_words:
-        for w in words:
-            tt = w["text"].strip()
-            if MONEY_RE.fullmatch(tt):
-                all_x.append(center_x(w))
+        for row in group_rows_by_top(words):
+            row_sorted = sorted(row, key=lambda w: w["x0"])
+            runs = detect_amount_runs(row_sorted)
+            for r in runs:
+                if MONEY_RE.match(r["text"]):
+                    cx = (r["x0"] + r["x1"]) / 2.0
+                    all_x.append(cx)
+                    if len(examples) < 10:
+                        examples.append((r["text"], cx))
+    if DEBUG:
+        st.write("Ejemplos de montos detectados para clúster:", examples)
     if not all_x:
         return None
     cents = kmeans_1d(all_x, k=3, iters=60)
@@ -183,13 +229,16 @@ def parse_with_alignment_fixed(pages_words):
             if "USTED PUEDE" in up or "TOTALES" in up:
                 continue
 
-            amts = [w for w in row_sorted if MONEY_RE.fullmatch(w["text"].strip()) and w["x1"] >= left_limit]
+            # Montos armados por runs
+            runs = detect_amount_runs(row_sorted)
+            amts = [r for r in runs if MONEY_RE.match(r["text"]) and r["x1"] >= left_limit]
             assigned = {"debito": None, "credito": None, "saldo": None}
-            for w in amts:
-                col = assign_amount_to_col(center_x(w), colmap or {})
+            for r in amts:
+                col = assign_amount_to_col((r["x0"] + r["x1"]) / 2.0, colmap or {})
                 if col in assigned and assigned[col] is None:
-                    assigned[col] = parse_money_es(w["text"])
+                    assigned[col] = parse_money_es(r["text"])
 
+            # Izquierda: fecha/comp/desc
             left_tokens = [w for w in row_sorted if w["x1"] < left_limit]
             left_texts = [w["text"] for w in left_tokens]
             date_tok, combte_tok = None, None
@@ -309,60 +358,33 @@ if uploaded:
 
     st.subheader("Movimientos")
     if df.empty:
-        st.warning("No se detectaron movimientos. Compartí un PDF ejemplo para ajustar reglas si fuese necesario.")
+        st.warning("No se detectaron movimientos. Activá Modo debug y compartir captura/ejemplo para ajustar.")
     else:
         st.dataframe(df)
 
-        # ---- Export: numeric + string + centavos ----
         out = io.BytesIO()
         with pd.ExcelWriter(out, engine="openpyxl") as writer:
             df_x = df.copy()
-
-            # Numeric (float) columns for convenience
             for col in ["debito","credito","saldo_calculado"]:
                 if col in df_x.columns:
                     df_x[col + "_num"] = df_x[col].apply(lambda x: float(x) if x is not None else 0.0)
-
-            # Exact string columns (Spanish formatting)
-            for col in ["debito","credito","saldo_calculado"]:
-                if col in df_x.columns:
                     df_x[col + "_str"] = df_x[col].apply(lambda d: f"{d:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-
-            # Centavos integer columns (lossless)
-            for col in ["debito","credito","saldo_calculado"]:
-                if col in df_x.columns:
                     df_x[col + "_centavos"] = df_x[col].apply(lambda d: to_centavos(d))
-
-            # Keep original Decimal columns too (as text)
             for col in ["debito","credito","saldo_calculado"]:
                 if col in df_x.columns:
                     df_x[col] = df_x[col].astype(str)
-
             df_x.to_excel(writer, index=False, sheet_name="Movimientos")
+            pd.DataFrame([resumen]).to_excel(writer, index=False, sheet_name="Resumen")
+        st.download_button("⬇️ Descargar Excel", data=out.getvalue(), file_name="credicoop_movimientos_v3_3.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-            # Resumen + centavos
-            res = resumen.copy()
-            # centavos extra
-            for k in ["saldo_anterior","debito_total","credito_total","saldo_calculado_final","saldo_final_informe","diferencia"]:
-                if res.get(k) not in (None, "None"):
-                    try:
-                        dec = Decimal(str(res[k]))
-                        res[k + "_centavos"] = to_centavos(dec)
-                    except Exception:
-                        pass
-            pd.DataFrame([res]).to_excel(writer, index=False, sheet_name="Resumen")
+    if DEBUG:
+        st.divider()
+        st.write("Centros de columnas (X):", colmap or "—")
+        # Muestra primeras líneas de la primera página (si hay)
+        if pages_lines and pages_lines[0]:
+            st.write("Primeras líneas:", pages_lines[0][:20])
 
-        st.download_button("⬇️ Descargar Excel (preciso para montos grandes)", data=out.getvalue(), file_name="credicoop_movimientos_v3_2.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-    st.caption(f"Estrategia: {used_strategy or '—'} | Columnas X: {colmap or '—'}")
+    st.caption(f"Estrategia: {used_strategy or '—'}")
 
 else:
     st.info("Subí un PDF para comenzar.")
-
-st.divider()
-with st.expander("Notas técnicas"):
-    st.markdown("""
-- Parser mantiene **Decimal** en memoria (sin límites prácticos para montos).
-- Excel incluye **numérico**, **string exacto** y **centavos (int)** para evitar pérdidas con montos muy grandes.
-- Alineación fija: **Débito (izq)**, **Crédito (medio)**, **Saldo (der)**. OCR solo si no hay texto.
-""")

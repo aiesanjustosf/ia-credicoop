@@ -1,8 +1,10 @@
 
-# Extractor Credicoop Online — v3.2 (grandes montos)
+# Extractor Credicoop Online — v3.3 (montos robustos + debug)
 
-- Decimal en parsing; export seguro para montos grandes.
-- Hojas Excel: Movimientos (num + string + centavos) y Resumen (incluye *_centavos).
+- Reconstruye montos aunque estén **partidos en tokens** y con **espacios finos**.
+- Mapeo fijo de columnas: **Débito (izq)**, **Crédito (medio)**, **Saldo (der)**.
+- Modo debug para inspección rápida y calibración.
 
 ## Deploy
-- Streamlit Cloud o Hugging Face Spaces (subí `app_credicoop.py`, `requirements.txt`, `packages.txt`).
+- Streamlit Cloud o Hugging Face Spaces.
+- Subí `app_credicoop.py`, `requirements.txt`, `packages.txt`.
