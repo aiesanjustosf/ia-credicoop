@@ -1,6 +1,0 @@
-# requirements.txt
-streamlit
-pandas
-numpy
-openpyxl
-pdfplumber  # La nueva librería Python-only para PDF
