@@ -1,9 +1,11 @@
 
-# app_credicoop.py (v3.3) — detección robusta de montos + alineación fija + debug
-# - Izq=Débito, Medio=Crédito, Der=Saldo
-# - Montos robustos: admite NBSP/thin spaces, tokens partidos, paréntesis (negativos), $
-# - Reconstruye montos a nivel de fila (merge tokens contiguos de dígitos/separadores)
-# - Debug mode para ver centroids y ejemplos
+# app_credicoop.py (v3.4) — reglas exactas por fila/fecha
+# Reglas:
+# 1) Cada fila válida TIENE FECHA (dd/mm/yy o dd/mm/yyyy). Sin fecha => continuación de descripción.
+# 2) Débito=columna izquierda, Crédito=columna del medio. "Saldo" (derecha) se IGNORA SIEMPRE.
+# 3) "SALDO ANTERIOR" y "SALDO AL dd/mm/aaaa" no son movimientos (sólo resumen).
+# 4) Líneas "saldo del día" (importe en col. SALDO, con o sin fecha) se ignoran.
+# 5) Export seguro para montos grandes.
 
 import io, re, os
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -25,13 +27,13 @@ try:
 except Exception:
     OCR_AVAILABLE = False
 
-st.set_page_config(page_title="Extractor Credicoop Online — v3.3", page_icon="📄")
-st.title("📄 Extractor Credicoop Online — v3.3 (montos robustos + debug)")
-st.caption("Alineación fija (Débito/Crédito/Saldo). Montos robustos con tokens partidos y espacios finos.")
+st.set_page_config(page_title="Extractor Credicoop Online — v3.4", page_icon="📄")
+st.title("📄 Extractor Credicoop Online — v3.4 (fecha obligatoria, saldo omitido)")
+st.caption("Cada movimiento tiene FECHA. Descripciones sin fecha se anexan arriba. Saldo (columna derecha) siempre se ignora.")
 
-DEBUG = st.checkbox("Modo debug", value=False, help="Muestra centroids, ejemplos de montos y primeras líneas.")
+DEBUG = st.checkbox("Modo debug", False)
 
-# Separadores posibles: punto, espacio, NBSP, thin space, figure space
+# Separadores y regex robustos
 SEP_CHARS = r"\.\u00A0\u202F\u2007 "  # .  NBSP  NARROW_NBSP  FIGURE_SPACE  space
 ALLOWED_IN_AMOUNT = re.compile(rf"^[\d,{SEP_CHARS}\(\)\-\$]+$")
 MONEY_RE = re.compile(rf"^\(?\$?\s*\d{{1,3}}(?:[{SEP_CHARS}]\d{{3}})*,\d{{2}}\)?$")
@@ -41,10 +43,8 @@ def parse_money_es(s: str) -> Decimal:
     s = (s or "").strip()
     neg = False
     if s.startswith("(") and s.endswith(")"):
-        neg = True
-        s = s[1:-1]
+        neg = True; s = s[1:-1]
     s = s.replace("$","").strip()
-    # normalizar separadores
     for ch in ["\u00A0","\u202F","\u2007"," "]:
         s = s.replace(ch, "")
     s = s.replace(".", "").replace(",", ".")
@@ -52,8 +52,7 @@ def parse_money_es(s: str) -> Decimal:
         d = Decimal(s)
     except InvalidOperation:
         return Decimal("0")
-    if neg:
-        d = -d
+    if neg: d = -d
     return d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 def is_date_token(tok: str) -> bool:
@@ -63,7 +62,7 @@ def is_date_token(tok: str) -> bool:
             return True
     return False
 
-def center_x(w): return (w["x0"] + w["x1"]) / 2.0
+def cx(w): return (w["x0"] + w["x1"]) / 2.0
 
 def group_rows_by_top(words, tolerance=2.0):
     rows = {}
@@ -133,10 +132,7 @@ def extract_words_ocr(pdf_bytes, dpi=300, lang="spa"):
     return pages_words, pages_lines
 
 def detect_amount_runs(row_sorted, max_gap=12.0):
-    """Une tokens contiguos que parezcan parte de un monto (solo dígitos y separadores)."""
-    runs = []
-    current = []
-    last_x1 = None
+    runs, current, last_x1 = [], [], None
     for w in row_sorted:
         t = w["text"]
         if ALLOWED_IN_AMOUNT.match(t):
@@ -145,11 +141,8 @@ def detect_amount_runs(row_sorted, max_gap=12.0):
             else:
                 runs.append(current); current = [w]; last_x1 = w["x1"]
         else:
-            if current:
-                runs.append(current); current = []; last_x1 = None
-    if current:
-        runs.append(current)
-    # Convert to string and bbox
+            if current: runs.append(current); current = []; last_x1 = None
+    if current: runs.append(current)
     assembled = []
     for run in runs:
         text = "".join(w["text"] for w in run).strip()
@@ -158,25 +151,19 @@ def detect_amount_runs(row_sorted, max_gap=12.0):
     return assembled
 
 def detect_columns_fixed(pages_words):
+    # Fija: izq=debito, medio=credito, der=saldo (por clúster global de X de montos)
     all_x = []
-    examples = []
     for words in pages_words:
         for row in group_rows_by_top(words):
             row_sorted = sorted(row, key=lambda w: w["x0"])
             runs = detect_amount_runs(row_sorted)
             for r in runs:
                 if MONEY_RE.match(r["text"]):
-                    cx = (r["x0"] + r["x1"]) / 2.0
-                    all_x.append(cx)
-                    if len(examples) < 10:
-                        examples.append((r["text"], cx))
-    if DEBUG:
-        st.write("Ejemplos de montos detectados para clúster:", examples)
-    if not all_x:
-        return None
+                    all_x.append((r["x0"] + r["x1"]) / 2.0)
+    if not all_x: return None
     cents = kmeans_1d(all_x, k=3, iters=60)
     uniq = []
-    for c in sorted(cents):
+    for c in cents:
         if not uniq or abs(c - uniq[-1]) > 10:
             uniq.append(c)
     if len(uniq) >= 3:
@@ -197,7 +184,11 @@ def assign_amount_to_col(x, colmap):
             best, best_d = k, d
     return best or "monto"
 
-def parse_with_alignment_fixed(pages_words):
+def to_centavos(dec: Decimal) -> int:
+    return int((dec * 100).to_integral_value(rounding=ROUND_HALF_UP))
+
+def parse_movements(pages_words):
+    # Leer SALDOS de resumen (para conciliación, no como movimientos)
     saldo_anterior, saldo_final = None, None
     for words in pages_words:
         for line in words_to_lines(words):
@@ -210,10 +201,15 @@ def parse_with_alignment_fixed(pages_words):
                 if m: saldo_final = parse_money_es(m[-1])
 
     colmap = detect_columns_fixed(pages_words)
-    rows_all = []
+    if DEBUG: st.write("Columnas X (centros):", colmap or "—")
+
+    rows_out = []
+    cont_desc_count = 0
+    ignored_saldo_dia = 0
 
     for words in pages_words:
         if not words: continue
+        # ubicación que separa "texto" de "importes"
         mov_cols = [v for k,v in (colmap or {}).items() if k in ("debito","credito") and v is not None]
         left_limit = min(mov_cols) - 20 if mov_cols else 999999
 
@@ -222,14 +218,13 @@ def parse_with_alignment_fixed(pages_words):
             row_sorted = sorted(row, key=lambda w: w["x0"])
             up = " ".join(w["text"] for w in row_sorted).strip().upper()
 
-            if any(h in up for h in ("FECHA","COMBTE","DEBITO","CREDITO","SALDO")) and len(row_sorted) <= 8:
+            # Ignorar encabezados y resumen
+            if ("FECHA" in up and "DESCRIPCION" in up) or "USTED PUEDE" in up:
                 continue
             if "SALDO ANTERIOR" in up or "SALDO AL" in up:
                 continue
-            if "USTED PUEDE" in up or "TOTALES" in up:
-                continue
 
-            # Montos armados por runs
+            # Montos (sólo a la derecha del bloque de importes)
             runs = detect_amount_runs(row_sorted)
             amts = [r for r in runs if MONEY_RE.match(r["text"]) and r["x1"] >= left_limit]
             assigned = {"debito": None, "credito": None, "saldo": None}
@@ -238,69 +233,77 @@ def parse_with_alignment_fixed(pages_words):
                 if col in assigned and assigned[col] is None:
                     assigned[col] = parse_money_es(r["text"])
 
-            # Izquierda: fecha/comp/desc
+            # Texto a la izquierda (fecha/combte/desc)
             left_tokens = [w for w in row_sorted if w["x1"] < left_limit]
             left_texts = [w["text"] for w in left_tokens]
+
+            # Si NO hay fecha al inicio -> es continuación de descripción / "saldo del día"
             date_tok, combte_tok = None, None
             if left_texts and is_date_token(left_texts[0]):
                 date_tok = left_texts[0]
                 if len(left_texts) > 1 and left_texts[1].isdigit():
                     combte_tok = left_texts[1]
+
+            # Caso A: no hay fecha => continuación (NUNCA crea movimiento)
+            if not date_tok:
+                # Si sólo hay importe en 'saldo' (y sin deb/cred), es "saldo del día" => ignorar
+                if (assigned["debito"] is None and assigned["credito"] is None) and assigned["saldo"] is not None:
+                    ignored_saldo_dia += 1
+                    continue
+                # anexar texto a descripción actual
+                if left_texts and (assigned["debito"] is None and assigned["credito"] is None):
+                    if current:
+                        extra = " ".join(left_texts).strip()
+                        if extra:
+                            current["descripcion"] = (current["descripcion"] + " | " + extra) if current["descripcion"] else extra
+                            cont_desc_count += 1
+                    continue
+                # si hay importes en deb/cred sin fecha (no debería pasar): los ignoramos
+                continue
+
+            # Caso B: hay fecha => NUEVO movimiento
+            # Descripción: todo lo que queda a la izquierda tras quitar fecha y combte
             desc_tokens = left_texts[:]
-            if date_tok and desc_tokens and desc_tokens[0] == date_tok: desc_tokens.pop(0)
+            if desc_tokens and desc_tokens[0] == date_tok: desc_tokens.pop(0)
             if combte_tok and desc_tokens and desc_tokens[0] == combte_tok: desc_tokens.pop(0)
             description = " ".join(desc_tokens).strip()
 
+            # Tomar débito o crédito (saldo se ignora siempre)
             debit_val = assigned["debito"] or Decimal("0")
             credit_val = assigned["credito"] or Decimal("0")
 
-            has_movement = (debit_val > 0) or (credit_val > 0)
-            is_continuation = (not has_movement) and bool(description)
-
-            if date_tok or has_movement:
-                if current:
-                    rows_all.append(current); current = None
-                current = {
-                    "fecha": date_tok,
-                    "comprobante": combte_tok,
-                    "descripcion": description,
-                    "debito": debit_val,
-                    "credito": credit_val,
-                }
-            elif is_continuation and current:
-                current["descripcion"] = (current["descripcion"] + " | " + description) if current["descripcion"] else description
+            # Cerrar movimiento anterior y abrir este
+            if current:
+                rows_out.append(current); current = None
+            current = {
+                "fecha": date_tok,
+                "comprobante": combte_tok,
+                "descripcion": description,
+                "debito": debit_val,
+                "credito": credit_val,
+            }
 
         if current:
-            rows_all.append(current)
+            rows_out.append(current)
 
-    df = pd.DataFrame(rows_all, columns=["fecha","comprobante","descripcion","debito","credito"])
+    df = pd.DataFrame(rows_out, columns=["fecha","comprobante","descripcion","debito","credito"])
+    # Drop filas vacías de importes si las hubiera (pero todas tienen fecha)
     if not df.empty:
         df["debito"] = df["debito"].fillna(Decimal("0"))
         df["credito"] = df["credito"].fillna(Decimal("0"))
-        df = df[(df["debito"] > 0) | (df["credito"] > 0) | (df["descripcion"].fillna("").str.len() > 0)]
-    return df, saldo_anterior, saldo_final, colmap
+        # Al menos uno de los dos puede ser 0, pero conservamos la fila porque tiene fecha y descripción
 
-def to_centavos(dec: Decimal) -> int:
-    return int((dec * 100).to_integral_value(rounding=ROUND_HALF_UP))
+    stats = {"continuaciones_agregadas": cont_desc_count, "saldos_dia_ignorados": ignored_saldo_dia}
+    return df, saldo_anterior, saldo_final, stats, colmap
 
 def reconcile(df, saldo_anterior, saldo_final):
     deb_total = df["debito"].sum() if not df.empty else Decimal("0")
     cred_total = df["credito"].sum() if not df.empty else Decimal("0")
-    calc_final = None
-    diff = None
+    calc_final, diff = None, None
     if saldo_anterior is not None:
         calc_final = saldo_anterior - deb_total + cred_total
     if calc_final is not None and saldo_final is not None:
         diff = calc_final - saldo_final
-
-    if saldo_anterior is not None and not df.empty:
-        running = []
-        bal = saldo_anterior
-        for _, r in df.iterrows():
-            bal = bal - r["debito"] + r["credito"]
-            running.append(bal)
-        df["saldo_calculado"] = running
-
     resumen = {
         "saldo_anterior": str(saldo_anterior) if saldo_anterior is not None else None,
         "debito_total": str(deb_total),
@@ -317,7 +320,6 @@ uploaded = st.file_uploader("Subí tu PDF del Banco Credicoop", type=["pdf"])
 
 if uploaded:
     pdf_bytes = uploaded.read()
-    used_strategy = None
 
     pages_words, pages_lines = [], []
     if PDF_AVAILABLE:
@@ -327,23 +329,17 @@ if uploaded:
         except Exception:
             pages_words, pages_lines = [], []
 
-    if pages_words and any(len(w)>0 for w in pages_words):
-        df, s_ant, s_fin, colmap = parse_with_alignment_fixed(pages_words)
-        used_strategy = "texto-posicional"
-    else:
+    # Si no hay palabras, intentar OCR (ultimo recurso)
+    if not pages_words or all(len(p)==0 for p in pages_words):
         if OCR_AVAILABLE:
             with st.spinner("OCR en progreso…"):
                 try:
                     pages_words, pages_lines = extract_words_ocr(pdf_bytes, dpi=300, lang="spa")
-                    df, s_ant, s_fin, colmap = parse_with_alignment_fixed(pages_words)
-                    used_strategy = "ocr-posicional"
                 except Exception as e:
                     st.error(f"OCR no disponible o falló: {e}")
-                    df, s_ant, s_fin, colmap = pd.DataFrame(), None, None, None
-        else:
-            st.error("No se detectó texto en el PDF y OCR no está habilitado en este entorno.")
-            df, s_ant, s_fin, colmap = pd.DataFrame(), None, None, None
+                    pages_words = []
 
+    df, s_ant, s_fin, stats, colmap = parse_movements(pages_words)
     df, resumen = reconcile(df, s_ant, s_fin)
 
     st.subheader("Conciliación")
@@ -356,35 +352,30 @@ if uploaded:
     c2[1].metric("Saldo final (calculado)", resumen["saldo_calculado_final"] or "—")
     c2[2].metric("Diferencia", resumen["diferencia"] or "—")
 
-    st.subheader("Movimientos")
+    st.subheader("Movimientos (fecha obligatoria)")
     if df.empty:
-        st.warning("No se detectaron movimientos. Activá Modo debug y compartir captura/ejemplo para ajustar.")
+        st.warning("No se detectaron movimientos con fecha. Mandame un ejemplo para ajustar reglas.")
     else:
         st.dataframe(df)
 
+        # Export seguro (Decimal + num + str + centavos)
         out = io.BytesIO()
         with pd.ExcelWriter(out, engine="openpyxl") as writer:
             df_x = df.copy()
-            for col in ["debito","credito","saldo_calculado"]:
-                if col in df_x.columns:
-                    df_x[col + "_num"] = df_x[col].apply(lambda x: float(x) if x is not None else 0.0)
-                    df_x[col + "_str"] = df_x[col].apply(lambda d: f"{d:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-                    df_x[col + "_centavos"] = df_x[col].apply(lambda d: to_centavos(d))
-            for col in ["debito","credito","saldo_calculado"]:
-                if col in df_x.columns:
-                    df_x[col] = df_x[col].astype(str)
+            for col in ["debito","credito"]:
+                df_x[col + "_num"] = df_x[col].apply(lambda x: float(x) if x is not None else 0.0)
+                df_x[col + "_str"] = df_x[col].apply(lambda d: f"{d:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+                df_x[col + "_centavos"] = df_x[col].apply(lambda d: int((d*100).to_integral_value(rounding=ROUND_HALF_UP)))
+            for col in ["debito","credito"]:
+                df_x[col] = df_x[col].astype(str)
             df_x.to_excel(writer, index=False, sheet_name="Movimientos")
             pd.DataFrame([resumen]).to_excel(writer, index=False, sheet_name="Resumen")
-        st.download_button("⬇️ Descargar Excel", data=out.getvalue(), file_name="credicoop_movimientos_v3_3.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button("⬇️ Descargar Excel", data=out.getvalue(), file_name="credicoop_movimientos_v3_4.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     if DEBUG:
         st.divider()
-        st.write("Centros de columnas (X):", colmap or "—")
-        # Muestra primeras líneas de la primera página (si hay)
-        if pages_lines and pages_lines[0]:
-            st.write("Primeras líneas:", pages_lines[0][:20])
-
-    st.caption(f"Estrategia: {used_strategy or '—'}")
+        st.write("Columnas X (centros):", colmap or "—")
+        st.write("Stats:", stats)
 
 else:
     st.info("Subí un PDF para comenzar.")

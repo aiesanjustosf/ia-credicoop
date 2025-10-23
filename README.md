@@ -1,10 +1,10 @@
 
-# Extractor Credicoop Online — v3.3 (montos robustos + debug)
+# Extractor Credicoop Online — v3.4 (fecha obligatoria, saldo omitido)
 
-- Reconstruye montos aunque estén **partidos en tokens** y con **espacios finos**.
-- Mapeo fijo de columnas: **Débito (izq)**, **Crédito (medio)**, **Saldo (der)**.
-- Modo debug para inspección rápida y calibración.
+Reglas:
+- Cada **movimiento** es una fila con **FECHA**.  
+- Líneas **sin fecha** = continuación de la descripción anterior (no crean movimiento).  
+- **Saldo** (columna derecha) se **omite siempre**; no hay saldo por fila ni por día.  
+- **SALDO ANTERIOR** y **SALDO AL** sólo van al resumen (no como movimientos).
 
-## Deploy
-- Streamlit Cloud o Hugging Face Spaces.
-- Subí `app_credicoop.py`, `requirements.txt`, `packages.txt`.
+Export: columnas numéricas, texto exacto y centavos (int) para montos grandes.
