@@ -1,10 +1,9 @@
-# Extractor Credicoop — determinista (vFinal)
+# Extractor Credicoop — determinista (vFinal+)
 # Reglas:
 # • Movimiento = fila con FECHA válida (dd/mm/aa|aaaa) a la izquierda de la columna Débito.
-# • En una fila con fecha, el monto del movimiento es SIEMPRE el MÁS IZQUIERDO.
-# • Clasificación por alineación (bandas): Izq=Débito, Centro=Crédito, Der=Saldo.
-# • El "Saldo del día" de cada fila se IGNORA SIEMPRE.
-# • "SALDO ANTERIOR" y "SALDO AL dd/mm/aaaa" se agregan como filas especiales.
+# • En una fila con fecha, el monto del movimiento es SIEMPRE el MÁS IZQUIERDO que NO sea "Saldo".
+# • Clasificación por alineación (bandas): Izq=Débito, Centro=Crédito, Der=Saldo (el saldo de la fila se ignora).
+# • "SALDO ANTERIOR" y "SALDO AL dd/mm/aaaa" se agregan como filas especiales (leídos por texto).
 # • Conciliación obligatoria: saldo_inicial − ΣDébitos + ΣCréditos == saldo_final (±$0,01).
 
 import io, re, unicodedata
@@ -26,8 +25,6 @@ AMT_TXT = r"\d{1,3}(?:[.\u00A0\u202F\u2007]\d{3})*,\d{2}"
 DATE_PATTS = [re.compile(r"^\d{2}/\d{2}/\d{2}$"), re.compile(r"^\d{2}/\d{2}/\d{4}$")]
 DATE_STRICT = re.compile(r"^(0[1-9]|[12][0-9]|3[01])/(0[1-9]|1[0-2])/(\d{2}|\d{4})$")
 DATE_CHARS = re.compile(r"^[0-9/]+$")
-
-_PDF_BYTES_CACHE = b""  # para lectura de texto en saldos
 
 def q2(x: Decimal) -> Decimal:
     return x.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -90,39 +87,35 @@ def normalize_token(t: str) -> str:
     t = "".join(ch for ch in t if unicodedata.category(ch) != "Mn")
     return re.sub(r"[^A-Z]", "", t)
 
-# ---------------- Columnas (encabezado tolerante + fallback por montos) ----------------
+# ---------------- Columnas (encabezado MISMA FILA + fallback por montos) ----------------
+
+def _find_label_center_in_row(row_sorted, label: str):
+    # Busca "DEBITO"/"CREDITO"/"SALDO" armando ventanas de tokens contiguos
+    toks_norm = [normalize_token(wtext(w)) for w in row_sorted]
+    n = len(toks_norm); L = len(label)
+    for i in range(n):
+        acc = ""
+        for j in range(i, min(n, i+8)):  # hasta 8 tokens para cubrir "D E B I T O"
+            acc += toks_norm[j]
+            if len(acc) < L: 
+                continue
+            if acc.startswith(label):
+                span = row_sorted[i:j+1]
+                return (min(w["x0"] for w in span) + max(w["x1"] for w in span)) / 2.0
+            if len(acc) > L:
+                break
+    return None
 
 def centers_from_headers(words) -> Dict[str, float]:
-    """Detecta centros por encabezados tolerantes (DEBITO/CREDITO/SALDO, con o sin espacios/acentos)."""
-    rows = group_rows_by_top(words)
-    found = {}
-    for row in rows:
+    """Detecta centros EXIGIENDO que DEBITO+CREDITO+SALDO estén en la MISMA FILA (mismo top)."""
+    for row in group_rows_by_top(words, tol=1.2):
         row_sorted = sorted(row, key=lambda w: w["x0"])
-        toks = [normalize_token(wtext(w)) for w in row_sorted]
-        joined = "".join(toks)  # p. ej. D E B I T O -> "DEBITO"
-
-        def find_seq(label: str):
-            idx = joined.find(label)
-            if idx == -1:
-                return None
-            acc = ""; take = []
-            for w, t in zip(row_sorted, toks):
-                if len(acc) < idx and t:
-                    acc += t; continue
-                if len(acc) >= idx and len("".join(normalize_token(wtext(x)) for x in take)) < len(label) and t:
-                    take.append(w)
-                    if len("".join(normalize_token(wtext(x)) for x in take)) >= len(label):
-                        break
-            if not take: return None
-            return (min(w["x0"] for w in take) + max(w["x1"] for w in take)) / 2.0
-
-        for lab, key in [("DEBITO","debito"), ("CREDITO","credito"), ("SALDO","saldo")]:
-            if key not in found:
-                cx = find_seq(lab)
-                if cx is not None:
-                    found[key] = cx
-
-    return found if len(found) == 3 else {}
+        cD = _find_label_center_in_row(row_sorted, "DEBITO")
+        cC = _find_label_center_in_row(row_sorted, "CREDITO")
+        cS = _find_label_center_in_row(row_sorted, "SALDO")
+        if cD is not None and cC is not None and cS is not None:
+            return {"debito": cD, "credito": cC, "saldo": cS}
+    return {}
 
 def centers_from_amounts(pages_words) -> Dict[str, float]:
     """Fallback robusto: terciles por página y promedio global."""
@@ -132,7 +125,7 @@ def centers_from_amounts(pages_words) -> Dict[str, float]:
         for row in group_rows_by_top(words):
             for a in detect_amount_runs(sorted(row, key=lambda w: w["x0"])):
                 if MONEY_RE.match(a["text"]):
-                    xs.append((a["x0"]+a["x1"])/2.0)
+                    xs.append((a["x0"]+a["x1"]) / 2.0)
         if len(xs) >= 3:
             xs = sorted(xs); n = len(xs)
             c = [xs[n//6], xs[n//2], xs[5*n//6]]  # terciles robustos
@@ -155,7 +148,6 @@ def compute_bands(c: Dict[str, float]):
 def classify_by_band(x: float, b) -> str:
     # guarda por si bordes vienen mal
     if b["borde_D"] >= b["borde_C"]:
-        # fallback directo a medias entre centros
         if x <= (b["xD"] + b["xC"]) / 2.0: return "debito"
         if x <= (b["xC"] + b["xS"]) / 2.0: return "credito"
         return "saldo"
@@ -220,9 +212,6 @@ def read_summary_balances_from_text(pdf_bytes: bytes):
 # ---------------- Parser principal ----------------
 
 def parse_pdf(pdf_bytes: bytes) -> pd.DataFrame:
-    global _PDF_BYTES_CACHE
-    _PDF_BYTES_CACHE = pdf_bytes
-
     pages_words = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for p in pdf.pages:
@@ -230,7 +219,7 @@ def parse_pdf(pdf_bytes: bytes) -> pd.DataFrame:
                                  extra_attrs=["x0","x1","top","bottom"]) or []
             pages_words.append(ws)
 
-    # 1) Columnas: encabezado tolerante; si no, fallback por montos
+    # 1) Columnas: encabezado MISMA FILA; si no, fallback por montos
     centers = {}
     for ws in pages_words:
         centers = centers_from_headers(ws)
@@ -245,21 +234,25 @@ def parse_pdf(pdf_bytes: bytes) -> pd.DataFrame:
     # 2) Saldos del resumen (por TEXTO)
     saldo_ant, saldo_fin, fecha_fin = read_summary_balances_from_text(pdf_bytes)
 
-    # 3) Movimientos por fecha (estricta). "Saldo del día" ignorado. Flush inmediato.
+    # 3) Movimientos por fecha (estricta). Saldo del día ignorado. Flush inmediato.
     movs = []
     for words in pages_words:
         if not words: continue
         current = None
-        for row in group_rows_by_top(words):
+        for row in group_rows_by_top(words, tol=1.0):  # más fino
             row_sorted = sorted(row, key=lambda w: w["x0"])
-            up = " ".join(wtext(w) for w in row_sorted).upper()
-            if any(k in up for k in ["USTED PUEDE", "TOTALES", "SALDO ANTERIOR", "SALDO AL"]):
+
+            # Saltar la fila de encabezados si aparece aquí (los 3 rótulos en la misma fila)
+            if centers_from_headers(row_sorted):
                 continue
 
-            # Fecha obligatoria (sólo zona izquierda)
+            up = " ".join(wtext(w) for w in row_sorted).upper()
+            if any(k in up for k in ["USTED PUEDE", "TOTALES"]):
+                continue
+
+            # Fecha obligatoria
             date_txt, left_desc = detect_date_strict(row_sorted, bands)
             if not date_txt:
-                # Sólo complemento descripción anterior; jamás creo movimiento sin fecha.
                 if current and left_desc:
                     extra = " ".join(wtext(w) for w in left_desc).strip()
                     if extra:
@@ -270,20 +263,25 @@ def parse_pdf(pdf_bytes: bytes) -> pd.DataFrame:
             if current:
                 movs.append(current)
 
-            # Montos de la fila (si hay): el MOVIMIENTO es el MÁS IZQUIERDO.
+            # Montos de la fila → elegir NO-saldo, priorizando Débito, si no Crédito
             amts = [a for a in detect_amount_runs(row_sorted) if MONEY_RE.match(a["text"])]
-            amts.sort(key=lambda a: a["x0"])
+            by = {"debito": [], "credito": [], "saldo": []}
+            for a in amts:
+                cx = (a["x0"] + a["x1"]) / 2.0
+                by[classify_by_band(cx, bands)].append(a)
+
             deb = cre = Decimal("0.00")
-            if amts:
-                mov = amts[0]  # izquierda → derecha
-                cx = (mov["x0"] + mov["x1"]) / 2.0
-                col = classify_by_band(cx, bands)
-                val = parse_money_es(mov["text"])
-                if col == "debito":
-                    deb = val
-                elif col == "credito":
-                    cre = val
-                # El resto de montos (incluido SALDO) se ignoran
+            pick = None
+            if by["debito"]:
+                pick = sorted(by["debito"], key=lambda a: a["x0"])[0]
+            elif by["credito"]:
+                pick = sorted(by["credito"], key=lambda a: a["x0"])[0]
+
+            if pick:
+                val = parse_money_es(pick["text"])
+                if pick in by["debito"]: deb = val
+                else: cre = val
+            # Todo lo clasificado como "saldo" se ignora
 
             current = {
                 "fecha": date_txt,
@@ -295,7 +293,6 @@ def parse_pdf(pdf_bytes: bytes) -> pd.DataFrame:
         # fin de página → push si quedó algo abierto
         if current:
             movs.append(current)
-            current = None
 
     # 4) Salida con filas especiales de saldo
     rows = []
@@ -338,7 +335,8 @@ if not pdf:
     st.stop()
 
 try:
-    df = parse_pdf(pdf.read())
+    pdf_bytes = pdf.read()
+    df = parse_pdf(pdf_bytes)
 except Exception as e:
     st.error(f"Error al parsear: {e}")
     st.stop()
