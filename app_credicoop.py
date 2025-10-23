@@ -1,9 +1,9 @@
-# Extractor Credicoop — determinista
-# Reglas clave:
-# • Movimiento = fila con FECHA válida a la izquierda de la columna Débito.
+# Extractor Credicoop — determinista (vFinal)
+# Reglas:
+# • Movimiento = fila con FECHA válida (dd/mm/aa|aaaa) a la izquierda de la columna Débito.
 # • En una fila con fecha, el monto del movimiento es SIEMPRE el MÁS IZQUIERDO.
 # • Clasificación por alineación (bandas): Izq=Débito, Centro=Crédito, Der=Saldo.
-# • El "Saldo del día" de cada fila se IGNORA SIEMPRE (no suma a débitos/créditos).
+# • El "Saldo del día" de cada fila se IGNORA SIEMPRE.
 # • "SALDO ANTERIOR" y "SALDO AL dd/mm/aaaa" se agregan como filas especiales.
 # • Conciliación obligatoria: saldo_inicial − ΣDébitos + ΣCréditos == saldo_final (±$0,01).
 
@@ -22,9 +22,12 @@ st.title("📄 Extractor Credicoop")
 
 SEP_CHARS = r"\.\u00A0\u202F\u2007 "                               # ., NBSP, NARROW_NBSP, FIGURE_SPACE, space
 MONEY_RE = re.compile(rf"^\(?\$?\s*\d{{1,3}}(?:[{SEP_CHARS}]\d{{3}})*,\d{{2}}\)?$")
+AMT_TXT = r"\d{1,3}(?:[.\u00A0\u202F\u2007]\d{3})*,\d{2}"
 DATE_PATTS = [re.compile(r"^\d{2}/\d{2}/\d{2}$"), re.compile(r"^\d{2}/\d{2}/\d{4}$")]
 DATE_STRICT = re.compile(r"^(0[1-9]|[12][0-9]|3[01])/(0[1-9]|1[0-2])/(\d{2}|\d{4})$")
 DATE_CHARS = re.compile(r"^[0-9/]+$")
+
+_PDF_BYTES_CACHE = b""  # para lectura de texto en saldos
 
 def q2(x: Decimal) -> Decimal:
     return x.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -122,20 +125,25 @@ def centers_from_headers(words) -> Dict[str, float]:
     return found if len(found) == 3 else {}
 
 def centers_from_amounts(pages_words) -> Dict[str, float]:
-    """Fallback: agrupa centros X de montos en 3 posiciones (izq/medio/der)."""
-    xs = []
+    """Fallback robusto: terciles por página y promedio global."""
+    per_page_centers = []
     for words in pages_words:
+        xs = []
         for row in group_rows_by_top(words):
             for a in detect_amount_runs(sorted(row, key=lambda w: w["x0"])):
                 if MONEY_RE.match(a["text"]):
-                    xs.append((a["x0"] + a["x1"]) / 2.0)
-    if len(xs) < 3:
+                    xs.append((a["x0"]+a["x1"])/2.0)
+        if len(xs) >= 3:
+            xs = sorted(xs); n = len(xs)
+            c = [xs[n//6], xs[n//2], xs[5*n//6]]  # terciles robustos
+            per_page_centers.append(c)
+    if not per_page_centers:
         return {}
-    xs = sorted(xs); n = len(xs)
-    # Cuantiles robustos (terciles), sin depender de k-means pesado
-    c = [xs[n//6], xs[n//2], xs[5*n//6]]
-    c = sorted(c)
-    return {"debito": c[0], "credito": c[1], "saldo": c[2]}
+    d = sum(c[0] for c in per_page_centers) / len(per_page_centers)
+    c = sum(c[1] for c in per_page_centers) / len(per_page_centers)
+    s = sum(c[2] for c in per_page_centers) / len(per_page_centers)
+    d, c, s = sorted([d, c, s])
+    return {"debito": d, "credito": c, "saldo": s}
 
 def compute_bands(c: Dict[str, float]):
     return {
@@ -145,9 +153,13 @@ def compute_bands(c: Dict[str, float]):
     }
 
 def classify_by_band(x: float, b) -> str:
-    if x <= b["borde_D"]: return "debito"
-    elif x <= b["borde_C"]: return "credito"
-    else: return "saldo"
+    # guarda por si bordes vienen mal
+    if b["borde_D"] >= b["borde_C"]:
+        # fallback directo a medias entre centros
+        if x <= (b["xD"] + b["xC"]) / 2.0: return "debito"
+        if x <= (b["xC"] + b["xS"]) / 2.0: return "credito"
+        return "saldo"
+    return "debito" if x <= b["borde_D"] else ("credito" if x <= b["borde_C"] else "saldo")
 
 # ---------------- Fecha estricta (sólo zona izquierda) ----------------
 
@@ -184,39 +196,33 @@ def detect_date_strict(row_sorted, bands, max_gap: float = 6.0):
 
 # ---------------- Resumen (SALDO ANTERIOR / SALDO AL ...) ----------------
 
-def pick_summary_amount(row, next_row, xS) -> str:
-    cands = []
-    for r in (row, next_row):
-        if not r: continue
-        rr = sorted(r, key=lambda w: w["x0"])
-        for a in detect_amount_runs(rr):
-            if MONEY_RE.match(a["text"]):
-                cx = (a["x0"] + a["x1"]) / 2.0
-                cands.append((abs(cx - xS), a["text"]))
-    if not cands:
-        return None
-    return min(cands, key=lambda t: t[0])[1]
+def _find_last_amount_in_text(s: str) -> str|None:
+    cands = list(re.finditer(AMT_TXT, s))
+    return cands[-1].group(0) if cands else None
 
-def read_summary_balances(pages_words, centers):
+def read_summary_balances_from_text(pdf_bytes: bytes):
     saldo_ant = None; saldo_fin = None; fecha_fin = None
-    xS = centers["saldo"]
-    for words in pages_words:
-        rows = group_rows_by_top(words)
-        for i, row in enumerate(rows):
-            txt = " ".join(wtext(w) for w in sorted(row, key=lambda w: w["x0"])).upper()
-            if "SALDO ANTERIOR" in txt:
-                amt = pick_summary_amount(row, rows[i+1] if i+1 < len(rows) else [], xS)
-                if amt: saldo_ant = parse_money_es(amt)
-            if "SALDO AL" in txt:
-                amt = pick_summary_amount(row, rows[i+1] if i+1 < len(rows) else [], xS)
-                if amt: saldo_fin = parse_money_es(amt)
-                m = re.search(r"\b(\d{2}/\d{2}/\d{4})\b", txt)
-                if m: fecha_fin = m.group(1)
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for p in pdf.pages:
+            txt = (p.extract_text(x_tolerance=1, y_tolerance=1) or "")
+            lines = [ln.strip().upper() for ln in txt.splitlines() if ln.strip()]
+            for i, ln in enumerate(lines):
+                if "SALDO ANTERIOR" in ln and saldo_ant is None:
+                    amt = _find_last_amount_in_text(ln) or (_find_last_amount_in_text(lines[i+1]) if i+1 < len(lines) else None)
+                    if amt: saldo_ant = parse_money_es(amt)
+                if "SALDO AL" in ln and saldo_fin is None:
+                    m = re.search(r"\b(\d{2}/\d{2}/\d{4})\b", ln)
+                    if m: fecha_fin = m.group(1)
+                    amt = _find_last_amount_in_text(ln) or (_find_last_amount_in_text(lines[i+1]) if i+1 < len(lines) else None)
+                    if amt: saldo_fin = parse_money_es(amt)
     return saldo_ant, saldo_fin, fecha_fin
 
 # ---------------- Parser principal ----------------
 
 def parse_pdf(pdf_bytes: bytes) -> pd.DataFrame:
+    global _PDF_BYTES_CACHE
+    _PDF_BYTES_CACHE = pdf_bytes
+
     pages_words = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for p in pdf.pages:
@@ -236,10 +242,10 @@ def parse_pdf(pdf_bytes: bytes) -> pd.DataFrame:
 
     bands = compute_bands(centers)
 
-    # 2) Saldos del resumen
-    saldo_ant, saldo_fin, fecha_fin = read_summary_balances(pages_words, centers)
+    # 2) Saldos del resumen (por TEXTO)
+    saldo_ant, saldo_fin, fecha_fin = read_summary_balances_from_text(pdf_bytes)
 
-    # 3) Movimientos por fecha (estricta). "Saldo del día" ignorado.
+    # 3) Movimientos por fecha (estricta). "Saldo del día" ignorado. Flush inmediato.
     movs = []
     for words in pages_words:
         if not words: continue
@@ -260,7 +266,11 @@ def parse_pdf(pdf_bytes: bytes) -> pd.DataFrame:
                         current["descripcion"] = (current["descripcion"] + " | " + extra).strip()
                 continue
 
-            # Montos de la fila (si hay): el movimiento es el MÁS IZQUIERDO.
+            # FLUSH del anterior para no “comer” el primero
+            if current:
+                movs.append(current)
+
+            # Montos de la fila (si hay): el MOVIMIENTO es el MÁS IZQUIERDO.
             amts = [a for a in detect_amount_runs(row_sorted) if MONEY_RE.match(a["text"])]
             amts.sort(key=lambda a: a["x0"])
             deb = cre = Decimal("0.00")
@@ -275,16 +285,17 @@ def parse_pdf(pdf_bytes: bytes) -> pd.DataFrame:
                     cre = val
                 # El resto de montos (incluido SALDO) se ignoran
 
-            if current:
-                movs.append(current)
             current = {
                 "fecha": date_txt,
                 "descripcion": " ".join(wtext(w) for w in left_desc).strip(),
                 "debito": deb,
                 "credito": cre,
             }
+
+        # fin de página → push si quedó algo abierto
         if current:
             movs.append(current)
+            current = None
 
     # 4) Salida con filas especiales de saldo
     rows = []
@@ -364,4 +375,3 @@ if ok:
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
     st.error("❌ La conciliación NO cierra (±$0,01). Revisá que los montos caigan en la banda correcta y que el PDF no tenga separadores rotos.")
-
