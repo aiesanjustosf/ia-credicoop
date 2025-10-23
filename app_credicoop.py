@@ -1,5 +1,13 @@
-# app_credicoop.py (v3.5) — fecha reconstruida por tokens + reglas v3.4
-# ... (see file header in code above)
+
+# app_credicoop.py (v3.6) — saldo inicial/final como filas + control de conciliación
+# Cambios clave:
+# 1) Detecta **SALDO ANTERIOR** (primera fila) y **SALDO AL ...** (última fila):
+#    - Busca el importe en la línea del texto o la siguiente, y toma el más cercano al centro de la columna SALDO.
+#    - Crea filas especiales: tipo='saldo_inicial' / 'saldo_final' con columna 'saldo' (debito=credito=0).
+# 2) Movimientos: fecha obligatoria; descripción puede continuar; Débito=izq, Crédito=medio; SALDO (derecha) se ignora.
+#    - Se eliminó el filtro por left_limit para no perder Débitos.
+# 3) Control de conciliación: exige que saldo_inicial - sum(debitos) + sum(creditos) ≈ saldo_final (±$0.01) antes de exportar.
+
 import io, re, os
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import List, Dict, Optional, Tuple
@@ -20,13 +28,14 @@ try:
 except Exception:
     OCR_AVAILABLE = False
 
-st.set_page_config(page_title="Extractor Credicoop Online — v3.5", page_icon="📄")
-st.title("📄 Extractor Credicoop Online — v3.5 (fecha reconstruida)")
-st.caption("Reconstruye fechas tokenizadas (0 1 / 0 8 / 2 5 → 01/08/25). Mantiene reglas: fecha obligatoria, saldo omitido, alineación fija.")
+st.set_page_config(page_title="Extractor Credicoop Online — v3.6", page_icon="📄")
+st.title("📄 Extractor Credicoop Online — v3.6")
+st.caption("Saldo inicial/final como filas. Fecha obligatoria en movimientos. Alineación fija (Débito/Crédito). Control de conciliación.")
 
 DEBUG = st.checkbox("Modo debug", False)
 
-SEP_CHARS = r"\.\u00A0\u202F\u2007 "
+# Regex y separadores
+SEP_CHARS = r"\.\u00A0\u202F\u2007 "  # .  NBSP  NARROW_NBSP  FIGURE_SPACE  space
 ALLOWED_IN_AMOUNT = re.compile(rf"^[\d,{SEP_CHARS}\(\)\-\$]+$")
 MONEY_RE = re.compile(rf"^\(?\$?\s*\d{{1,3}}(?:[{SEP_CHARS}]\d{{3}})*,\d{{2}}\)?$")
 DATE_RES = [re.compile(r"^\d{2}/\d{2}/\d{2}$"), re.compile(r"^\d{2}/\d{2}/\d{4}$")]
@@ -35,7 +44,7 @@ DATE_CHARS = re.compile(r"^[0-9/]+$")
 def parse_money_es(s: str) -> Decimal:
     s = (s or "").strip()
     neg = False
-    if s.startswith("(") and s.endswith(")"):
+    if s.startswith("(") and s.endswith(")")):
         neg = True; s = s[1:-1]
     s = s.replace("$","").strip()
     for ch in ["\u00A0","\u202F","\u2007"," "]:
@@ -49,8 +58,9 @@ def parse_money_es(s: str) -> Decimal:
     return d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 def is_date_string(txt: str) -> bool:
+    t = (txt or "").strip()
     for r in DATE_RES:
-        if r.match(txt.strip()):
+        if r.match(t):
             return True
     return False
 
@@ -63,7 +73,7 @@ def group_rows_by_top(words, tolerance=2.0):
         rows.setdefault(key, []).append(w)
     return [rows[k] for k in sorted(rows.keys())]
 
-def words_to_lines(words):
+def words_to_lines(words) -> List[str]:
     lines = []
     for row in group_rows_by_top(words, tolerance=2.0):
         row_sorted = sorted(row, key=lambda w: w["x0"])
@@ -95,7 +105,6 @@ def kmeans_1d(xs, k=3, iters=60):
 
 def extract_words_pdf(pdf_bytes):
     pages_words, pages_lines = [], []
-    import pdfplumber
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             words = page.extract_words(use_text_flow=True, keep_blank_chars=False, extra_attrs=["x0","x1","top","bottom"]) or []
@@ -106,8 +115,6 @@ def extract_words_pdf(pdf_bytes):
 
 def extract_words_ocr(pdf_bytes, dpi=300, lang="spa"):
     pages_words, pages_lines = [], []
-    from pdf2image import convert_from_bytes
-    import pytesseract
     images = convert_from_bytes(pdf_bytes, dpi=dpi)
     for img in images:
         data = pytesseract.image_to_data(img, lang=lang, output_type=pytesseract.Output.DICT)
@@ -127,6 +134,7 @@ def extract_words_ocr(pdf_bytes, dpi=300, lang="spa"):
     return pages_words, pages_lines
 
 def detect_amount_runs(row_sorted, max_gap=12.0):
+    # Une tokens contiguos de posibles montos (dígitos, separadores, $, paréntesis)
     runs, current, last_x1 = [], [], None
     for w in row_sorted:
         t = w["text"]
@@ -201,22 +209,52 @@ def assign_amount_to_col(x, colmap):
             best, best_d = k, d
     return best or "monto"
 
-def parse_movements(pages_words):
-    saldo_anterior, saldo_final = None, None
-    for words in pages_words:
-        for line in words_to_lines(words):
-            up = line.upper()
-            if "SALDO ANTERIOR" in up:
-                m = re.findall(MONEY_RE, line)
-                if m: saldo_anterior = parse_money_es(m[-1])
-            if "SALDO AL" in up:
-                m = re.findall(MONEY_RE, line)
-                if m: saldo_final = parse_money_es(m[-1])
+def leer_saldos_resumen(pages_words, colmap):
+    """Detecta SALDO ANTERIOR y SALDO AL ... buscando el importe en la línea del texto o la siguiente.
+       Prioriza el importe más cercano a la columna 'saldo'."""
+    saldo_ant = None
+    saldo_fin = None
+    fecha_fin = None
 
+    for words in pages_words:
+        rows = group_rows_by_top(words)
+        for i, row in enumerate(rows):
+            row_sorted = sorted(row, key=lambda w: w["x0"])
+            line_txt = " ".join(w["text"] for w in row_sorted).upper()
+            if ("SALDO ANTERIOR" in line_txt) or ("SALDO AL" in line_txt):
+                candidates = []
+                for r in (row, rows[i+1] if i+1 < len(rows) else []):
+                    if not r: continue
+                    r_sorted = sorted(r, key=lambda w: w["x0"])
+                    runs = detect_amount_runs(r_sorted)
+                    for run in runs:
+                        if MONEY_RE.match(run["text"]):
+                            cx_run = (run["x0"] + run["x1"]) / 2.0
+                            dist = abs(cx_run - ((colmap or {}).get("saldo") or 1e9))
+                            candidates.append((dist, run["text"]))
+                    # extra: fecha final si aparece en misma línea (después de "SALDO AL")
+                    if "SALDO AL" in line_txt:
+                        # buscamos un patrón dd/mm/aaaa en la misma línea
+                        joined = " ".join(w["text"] for w in r_sorted)
+                        m = re.search(r"\b(\d{2}/\d{2}/\d{4})\b", joined)
+                        if m:
+                            fecha_fin = m.group(1)
+                if candidates:
+                    monto_txt = min(candidates, key=lambda t: t[0])[1]
+                    if "SALDO ANTERIOR" in line_txt:
+                        saldo_ant = parse_money_es(monto_txt)
+                    else:
+                        saldo_fin = parse_money_es(monto_txt)
+    return saldo_ant, saldo_fin, fecha_fin
+
+def parse_movements(pages_words):
     colmap = detect_columns_fixed(pages_words)
     if DEBUG: st.write("Columnas X (centros):", colmap or "—")
 
-    rows_out, cont_desc_count, ignored_saldo_dia = [], 0, 0
+    # 1) Leer saldos de resumen con método robusto
+    saldo_anterior, saldo_final, fecha_final = leer_saldos_resumen(pages_words, colmap)
+
+    rows_mov, cont_desc_count, ignored_saldo_dia = [], 0, 0
 
     for words in pages_words:
         if not words: continue
@@ -228,26 +266,28 @@ def parse_movements(pages_words):
             row_sorted = sorted(row, key=lambda w: w["x0"])
             up = " ".join(w["text"] for w in row_sorted).strip().upper()
 
-            if ("FECHA" in up and "DESCRIPCION" in up) or "USTED PUEDE" in up:
-                continue
-            if "SALDO ANTERIOR" in up or "SALDO AL" in up:
-                continue
+            # Ignorar líneas de resumen / encabezados
+            if "USTED PUEDE" in up or "TOTALES" in up: continue
+            if ("SALDO ANTERIOR" in up) or ("SALDO AL" in up): continue
 
+            # Montos detectados (tomar TODOS y dejar que la alineación decida)
             runs = detect_amount_runs(row_sorted)
-            amts = [r for r in runs if MONEY_RE.match(r["text"]) and r["x1"] >= left_limit]
-            assigned = {"debito": None, "credito": None, "saldo": None}
+            amts = [r for r in runs if MONEY_RE.match(r["text"])]
+            # Asignación por columna
+            assigned = {"debito": [], "credito": [], "saldo": []}
             for r in amts:
                 col = assign_amount_to_col((r["x0"] + r["x1"]) / 2.0, colmap or {})
-                if col in assigned and assigned[col] is None:
-                    assigned[col] = parse_money_es(r["text"])
+                if col in assigned:
+                    assigned[col].append(parse_money_es(r["text"]))
 
+            # Texto izquierdo
             left_tokens = [w for w in row_sorted if w["x1"] < left_limit]
-
-            # Rebuild DATE
+            # Reconstruir FECHA
             date_txt, date_tokens = detect_date_run(left_tokens, max_gap=6.0)
             date_tok = date_txt if date_txt else None
             left_tokens_for_desc = [w for w in left_tokens if w not in date_tokens]
 
+            # Combte opcional
             combte_tok = None
             if date_tokens:
                 last_x1 = max(w["x1"] for w in date_tokens)
@@ -258,11 +298,12 @@ def parse_movements(pages_words):
                         combte_tok = near["text"]
                         left_tokens_for_desc = [w for w in left_tokens_for_desc if w is not near]
 
+            # Sin fecha => continuación o saldo del día; no crea movimiento
             if not date_tok:
-                if (assigned["debito"] is None and assigned["credito"] is None) and assigned["saldo"] is not None:
+                if (not assigned["debito"]) and (not assigned["credito"]) and assigned["saldo"]:
                     ignored_saldo_dia += 1
                     continue
-                if left_tokens_for_desc and (assigned["debito"] is None and assigned["credito"] is None):
+                if left_tokens_for_desc and (not assigned["debito"]) and (not assigned["credito"]):
                     if current:
                         extra = " ".join(w["text"] for w in left_tokens_for_desc).strip()
                         if extra:
@@ -271,12 +312,15 @@ def parse_movements(pages_words):
                     continue
                 continue
 
+            # Con fecha => nuevo movimiento
             description = " ".join(w["text"] for w in left_tokens_for_desc).strip()
-            debit_val = assigned["debito"] or Decimal("0")
-            credit_val = assigned["credito"] or Decimal("0")
+
+            # Elegir ÚNICO monto por fila (débito o crédito). Si hay más de uno por columna, sumarlos (poco común).
+            debit_val = sum(assigned["debito"]) if assigned["debito"] else Decimal("0")
+            credit_val = sum(assigned["credito"]) if assigned["credito"] else Decimal("0")
 
             if current:
-                rows_out.append(current); current = None
+                rows_mov.append(current); current = None
             current = {
                 "fecha": date_tok,
                 "comprobante": combte_tok,
@@ -286,34 +330,54 @@ def parse_movements(pages_words):
             }
 
         if current:
-            rows_out.append(current)
+            rows_mov.append(current)
 
-    df = pd.DataFrame(rows_out, columns=["fecha","comprobante","descripcion","debito","credito"])
-    if not df.empty:
-        df["debito"] = df["debito"].fillna(Decimal("0"))
-        df["credito"] = df["credito"].fillna(Decimal("0"))
-    stats = {"continuaciones_agregadas": cont_desc_count, "saldos_dia_ignorados": ignored_saldo_dia}
-    return df, saldo_anterior, saldo_final, stats, colmap
-
-def reconcile(df, saldo_anterior, saldo_final):
-    deb_total = df["debito"].sum() if not df.empty else Decimal("0")
-    cred_total = df["credito"].sum() if not df.empty else Decimal("0")
-    calc_final, diff = None, None
+    # 2) Insertar filas especiales de saldo inicial/final
+    rows_out = []
     if saldo_anterior is not None:
-        calc_final = saldo_anterior - deb_total + cred_total
-    if calc_final is not None and saldo_final is not None:
-        diff = calc_final - saldo_final
+        # Fecha para saldo inicial: preferimos la primera fecha de movimientos; si no hay, dejamos None
+        first_date = rows_mov[0]["fecha"] if rows_mov else None
+        rows_out.append({"tipo": "saldo_inicial", "fecha": first_date, "comprobante": None, "descripcion": "SALDO ANTERIOR", "debito": Decimal("0"), "credito": Decimal("0"), "saldo": saldo_anterior})
+    rows_out.extend({"tipo": "movimiento", **r, "saldo": None} for r in rows_mov)
+    if saldo_final is not None:
+        # Fecha para saldo final: usar la fecha detectada en "SALDO AL ..." si se pudo; si no, última fecha de movimiento
+        last_date = fecha_final or (rows_mov[-1]["fecha"] if rows_mov else None)
+        rows_out.append({"tipo": "saldo_final", "fecha": last_date, "comprobante": None, "descripcion": "SALDO AL", "debito": Decimal("0"), "credito": Decimal("0"), "saldo": saldo_final})
+
+    df = pd.DataFrame(rows_out, columns=["tipo","fecha","comprobante","descripcion","debito","credito","saldo"])
+    stats = {"continuaciones_agregadas": cont_desc_count, "saldos_dia_ignorados": ignored_saldo_dia}
+    return df, stats, colmap
+
+def reconciliar_control(df):
+    """Devuelve (ok:bool, resumen:dict, diff:Decimal)"""
+    # Totales
+    deb_total = df.loc[df["tipo"]=="movimiento", "debito"].sum() if not df.empty else Decimal("0")
+    cred_total = df.loc[df["tipo"]=="movimiento", "credito"].sum() if not df.empty else Decimal("0")
+    saldo_ini = df.loc[df["tipo"]=="saldo_inicial", "saldo"]
+    saldo_fin = df.loc[df["tipo"]=="saldo_final", "saldo"]
+    saldo_ini = saldo_ini.iloc[0] if len(saldo_ini)>0 else None
+    saldo_fin = saldo_fin.iloc[0] if len(saldo_fin)>0 else None
+
+    calc_fin = None
+    diff = None
+    if saldo_ini is not None:
+        calc_fin = saldo_ini - deb_total + cred_total
+    if calc_fin is not None and saldo_fin is not None:
+        diff = (calc_fin - saldo_fin).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    ok = (diff is not None) and (abs(diff) <= Decimal("0.01"))
     resumen = {
-        "saldo_anterior": str(saldo_anterior) if saldo_anterior is not None else None,
+        "saldo_anterior": str(saldo_ini) if saldo_ini is not None else None,
         "debito_total": str(deb_total),
         "credito_total": str(cred_total),
-        "saldo_calculado_final": str(calc_final) if calc_final is not None else None,
-        "saldo_final_informe": str(saldo_final) if saldo_final is not None else None,
+        "saldo_final_informe": str(saldo_fin) if saldo_fin is not None else None,
+        "saldo_final_calculado": str(calc_fin) if calc_fin is not None else None,
         "diferencia": str(diff) if diff is not None else None,
-        "n_registros": int(len(df)),
+        "n_movimientos": int((df["tipo"]=="movimiento").sum()) if not df.empty else 0,
     }
-    return df, resumen
+    return ok, resumen, diff
 
+# ---- UI ----
 uploaded = st.file_uploader("Subí tu PDF del Banco Credicoop", type=["pdf"])
 
 if uploaded:
@@ -336,37 +400,46 @@ if uploaded:
                     st.error(f"OCR no disponible o falló: {e}")
                     pages_words = []
 
-    df, s_ant, s_fin, stats, colmap = parse_movements(pages_words)
-    df, resumen = reconcile(df, s_ant, s_fin)
+    df, stats, colmap = parse_movements(pages_words)
 
-    st.subheader("Conciliación")
+    # Control de conciliación
+    ok, resumen, diff = reconciliar_control(df)
+
+    st.subheader("Control de conciliación")
     c = st.columns(3)
     c[0].metric("Saldo anterior", resumen["saldo_anterior"] or "—")
     c[1].metric("Débitos", resumen["debito_total"])
     c[2].metric("Créditos", resumen["credito_total"])
     c2 = st.columns(3)
     c2[0].metric("Saldo final (informado)", resumen["saldo_final_informe"] or "—")
-    c2[1].metric("Saldo final (calculado)", resumen["saldo_calculado_final"] or "—")
+    c2[1].metric("Saldo final (calculado)", resumen["saldo_final_calculado"] or "—")
     c2[2].metric("Diferencia", resumen["diferencia"] or "—")
 
-    st.subheader("Movimientos (fecha obligatoria)")
+    if not ok:
+        st.error("❌ La conciliación NO cierra. Revisá 'Saldo anterior', 'SALDO AL' y que los montos estén en la columna correcta. No se habilita la exportación hasta que cierre ±$0,01.")
+    else:
+        st.success("✅ Conciliación correcta (±$0,01).")
+
+    st.subheader("Tabla (incluye saldo inicial/final como filas)")
     if df.empty:
-        st.warning("No se detectaron movimientos con fecha. Encendé debug y compartí la salida si sigue sin tomar fechas.")
+        st.warning("No se detectaron filas. Activá debug y compartí la salida.")
     else:
         st.dataframe(df)
 
-        out = io.BytesIO()
-        with pd.ExcelWriter(out, engine="openpyxl") as writer:
-            df_x = df.copy()
-            for col in ["debito","credito"]:
-                df_x[col + "_num"] = df_x[col].apply(lambda x: float(x) if x is not None else 0.0)
-                df_x[col + "_str"] = df_x[col].apply(lambda d: f"{d:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-                df_x[col + "_centavos"] = df_x[col].apply(lambda d: int((d*100).to_integral_value(rounding=ROUND_HALF_UP)))
-            for col in ["debito","credito"]:
-                df_x[col] = df_x[col].astype(str)
-            df_x.to_excel(writer, index=False, sheet_name="Movimientos")
-            pd.DataFrame([resumen]).to_excel(writer, index=False, sheet_name="Resumen")
-        st.download_button("⬇️ Descargar Excel", data=out.getvalue(), file_name="credicoop_movimientos_v3_5.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        if ok:
+            # Export
+            out = io.BytesIO()
+            with pd.ExcelWriter(out, engine="openpyxl") as writer:
+                df_x = df.copy()
+                # Columnas numéricas auxiliares
+                for col in ["debito","credito","saldo"]:
+                    if col in df_x.columns:
+                        df_x[col + "_num"] = df_x[col].apply(lambda x: float(x) if x is not None else 0.0)
+                        df_x[col + "_centavos"] = df_x[col].apply(lambda d: int((d*100).to_integral_value(rounding=ROUND_HALF_UP)) if d is not None else 0)
+                        df_x[col] = df_x[col].astype(str)
+                df_x.to_excel(writer, index=False, sheet_name="Tabla")
+                pd.DataFrame([resumen]).to_excel(writer, index=False, sheet_name="Resumen")
+            st.download_button("⬇️ Descargar Excel (v3.6)", data=out.getvalue(), file_name="credicoop_movimientos_v3_6.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     if DEBUG:
         st.divider()

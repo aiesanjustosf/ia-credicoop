@@ -1,3 +1,7 @@
-# Extractor Credicoop Online — v3.5 (fecha reconstruida)
-Cambio único: reconstrucción de **fecha** a partir de tokens `[0-9/]` contiguos (tol. de espacio pequeña).
-Resto de reglas v3.4: fecha obligatoria, saldo omitido, alineación fija, montos grandes y export seguro.
+
+# Extractor Credicoop Online — v3.6 (saldo inicial/final + control)
+
+- Primer registro: **SALDO ANTERIOR** (fila especial)  
+- Último registro: **SALDO AL** (fila especial)  
+- Movimientos con **FECHA obligatoria**, débito/ crédito por alineación fija, **saldo de columna ignorado**.  
+- **Control de conciliación**: saldo anterior − débitos + créditos = saldo final (±$0,01). Export solo si cierra.
