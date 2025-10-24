@@ -180,11 +180,17 @@ def in_period(date_txt, start, end):
     return start <= d <= end
 
 def detect_date_strict(row_sorted, bands, period_year=None, start_period=None, end_period=None, max_gap: float = 6.0):
-    left_limit = bands["xD"] - 40
-    left = [w for w in row_sorted if w["x1"] <= left_limit]
-
+    """
+    Detector de fecha RELAJADO:
+    - Busca runs de fecha en TODA la fila.
+    - Acepta solo las que estén a la izquierda del BORDE entre Débito y Crédito (borde_D).
+    - Normaliza a AAAA si el período trae el año.
+    - Devuelve (fecha, tokens_descripcion) donde la descripción es lo que está a la derecha de la fecha y
+      ANTES de la columna de Débito (así no queda vacía).
+    """
+    # 1) formar runs con tokens que parezcan parte de una fecha (en toda la fila)
     runs, cur, last = [], [], None
-    for w in left:
+    for w in sorted(row_sorted, key=lambda w: w["x0"]):
         t = wtext(w)
         if DATE_CHARS.match(t):
             if last is None or (w["x0"] - last) <= max_gap:
@@ -195,22 +201,43 @@ def detect_date_strict(row_sorted, bands, period_year=None, start_period=None, e
             if cur: runs.append(cur); cur = []; last = None
     if cur: runs.append(cur)
 
-    best = None
+    # 2) quedarnos con la(s) que luzcan fecha válida y estén a la izquierda del borde Débito→Crédito
+    candidatos = []
     for run in runs:
         raw = "".join(wtext(w) for w in run)
-        if DATE_STRICT.fullmatch(raw):
-            txt = normalize_date(raw, period_year)
-            if period_year and not in_period(txt, start_period, end_period):
-                continue
-            x0 = min(w["x0"] for w in run)
-            if best is None or x0 < best[0]:
-                best = (x0, txt, run)
+        if not DATE_STRICT.fullmatch(raw):
+            continue
+        x0 = min(w["x0"] for w in run); x1 = max(w["x1"] for w in run)
+        cx = (x0 + x1) / 2.0
+        # clave: aceptar si el centro de la fecha está a la izquierda del borde entre Débito y Crédito
+        if cx <= bands["borde_D"] + 2:   # pequeño margen
+            # normalizar año si vino en 2 dígitos y tenemos período
+            txt = raw
+            if period_year and len(raw.split("/")[-1]) == 2:
+                d, m, y = raw.split("/")
+                txt = f"{d}/{m}/{period_year}"
+            # filtrar por período si lo conocemos
+            if period_year and start_period and end_period:
+                try:
+                    from datetime import datetime
+                    d = datetime.strptime(txt, "%d/%m/%Y").date()
+                    if not (start_period <= d <= end_period):
+                        continue
+                except Exception:
+                    continue
+            candidatos.append((x0, x1, txt, run))
 
-    if not best:
+    if not candidatos:
         return None, []
-    _, txt, toks = best
-    left_desc = [w for w in left if w not in toks]
-    return txt, left_desc
+
+    # 3) elegir la fecha más a la izquierda
+    candidatos.sort(key=lambda t: t[0])
+    x0, x1, txt, run = candidatos[0]
+
+    # 4) descripción = tokens a la derecha de la fecha y antes de la columna Débito
+    desc_tokens = [w for w in row_sorted if (w["x0"] >= x1 and w["x0"] < bands["borde_D"] - 2)]
+    return txt, desc_tokens
+
 
 # ---------------- Saldos por TEXTO ----------------
 
