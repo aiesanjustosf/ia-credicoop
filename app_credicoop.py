@@ -1,12 +1,13 @@
-# Extractor Credicoop — determinista (vFinal++)
+# Extractor Credicoop — determinista (recorte SALDO ANTERIOR → SALDO AL)
 # Reglas:
 # • Movimiento = fila con FECHA válida (dd/mm/aa|aaaa) a la izquierda de la columna Débito.
-# • En una fila con fecha, el monto del movimiento es SIEMPRE el MÁS IZQUIERDO que NO sea "Saldo".
-# • Clasificación por alineación (bandas): Izq=Débito, Centro=Crédito, Der=Saldo (el saldo de la fila se ignora).
-# • "SALDO ANTERIOR" y "SALDO AL dd/mm/aaaa" se leen por TEXTO (no por cajitas).
-# • Período del resumen: normaliza fechas "dd/mm/aa" → "dd/mm/AAAA" y descarta fechas fuera de rango.
-# • Filtros de secciones (CABAL, TRANSFERENCIAS, DETALLES, TOTALES, etc.).
-# • Conciliación obligatoria: saldo_inicial − ΣDébitos + ΣCréditos == saldo_final (±$0,01).
+# • El monto del movimiento es SIEMPRE el MÁS IZQUIERDO que NO sea "Saldo" (prioriza Débito).
+# • Columnas por encabezado (los 3 rótulos en la MISMA FILA) o fallback por montos.
+# • Sólo se procesa desde “SALDO ANTERIOR” hasta “SALDO AL …”.
+# • Se admiten líneas continuadas (sin fecha): se pegan a la descripción y, si falta monto, se toma de la continuación.
+# • “SALDO ANTERIOR” y “SALDO AL dd/mm/aaaa” se leen por TEXTO (no cajitas).
+# • Período del resumen: normaliza dd/mm/aa → dd/mm/AAAA y descarta fechas fuera de rango.
+# • Conciliación: saldo_inicial − ΣDébitos + ΣCréditos == saldo_final (±$0,01).
 
 import io, re, unicodedata
 from datetime import datetime
@@ -99,7 +100,7 @@ def _find_label_center_in_row(row_sorted, label: str):
         acc = ""
         for j in range(i, min(n, i+8)):  # hasta 8 tokens por si vienen espaciados
             acc += toks_norm[j]
-            if len(acc) < L: 
+            if len(acc) < L:
                 continue
             if acc.startswith(label):
                 span = row_sorted[i:j+1]
@@ -167,9 +168,8 @@ def extract_period(pdf_bytes):
     return start, end
 
 def normalize_date(txt, period_year):
-    # "dd/mm/aa" → usa el año del período
     d, m, y = txt.split("/")
-    if len(y) == 2:
+    if len(y) == 2 and period_year:
         y = str(period_year)
     return f"{d}/{m}/{y}"
 
@@ -199,7 +199,7 @@ def detect_date_strict(row_sorted, bands, period_year=None, start_period=None, e
     for run in runs:
         raw = "".join(wtext(w) for w in run)
         if DATE_STRICT.fullmatch(raw):
-            txt = normalize_date(raw, period_year) if (period_year and len(raw.split("/")[-1])==2) else raw
+            txt = normalize_date(raw, period_year)
             if period_year and not in_period(txt, start_period, end_period):
                 continue
             x0 = min(w["x0"] for w in run)
@@ -235,9 +235,29 @@ def read_summary_balances_from_text(pdf_bytes: bytes):
                     if amt: saldo_fin = parse_money_es(amt)
     return saldo_ant, saldo_fin, fecha_fin
 
-# ---------------- Parser principal ----------------
+# ---------------- Monto no-saldo ----------------
+
+def pick_non_saldo_amount(row_sorted, bands):
+    """Devuelve ('debito'|'credito', Decimal) tomando SIEMPRE un monto NO 'saldo'."""
+    amts = [a for a in detect_amount_runs(row_sorted) if MONEY_RE.match(a["text"])]
+    if not amts:
+        return None, Decimal("0.00")
+    by = {"debito": [], "credito": [], "saldo": []}
+    for a in amts:
+        cx = (a["x0"] + a["x1"]) / 2.0
+        by[classify_by_band(cx, bands)].append(a)
+    if by["debito"]:
+        pick = sorted(by["debito"], key=lambda a: a["x0"])[0]
+        return "debito", parse_money_es(pick["text"])
+    if by["credito"]:
+        pick = sorted(by["credito"], key=lambda a: a["x0"])[0]
+        return "credito", parse_money_es(pick["text"])
+    return None, Decimal("0.00")
+
+# ---------------- Parser principal (recorte tabla) ----------------
 
 def parse_pdf(pdf_bytes: bytes) -> pd.DataFrame:
+    # Palabras por página
     pages_words = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for p in pdf.pages:
@@ -261,60 +281,68 @@ def parse_pdf(pdf_bytes: bytes) -> pd.DataFrame:
     period_year = (start_period.year if start_period else None)
     saldo_ant, saldo_fin, fecha_fin = read_summary_balances_from_text(pdf_bytes)
 
-    # Movimientos
+    # Recorrer SOLO la tabla: desde SALDO ANTERIOR hasta SALDO AL...
     movs = []
+    in_table = False
+    stop_all = False
+
     for words in pages_words:
-        if not words: continue
+        if stop_all or not words:
+            break
+
         current = None
         for row in group_rows_by_top(words, tol=1.0):
             row_sorted = sorted(row, key=lambda w: w["x0"])
-
-            # saltar encabezados/leyendas/tablas auxiliares
             up = " ".join(wtext(w) for w in row_sorted).upper()
+
+            # entrar a tabla cuando aparece SALDO ANTERIOR
+            if not in_table:
+                if "SALDO ANTERIOR" in up:
+                    in_table = True
+                continue  # todo lo previo se ignora
+
+            # cortar DEFINITIVAMENTE cuando aparece SALDO AL
+            if "SALDO AL" in up:
+                stop_all = True
+                break
+
+            # saltar encabezados/leyendas auxiliares y fila de rótulos
             if any(bad in up for bad in BAD_HEADERS):
                 continue
-            # saltar fila exacta de encabezados si aparece en medio
             if (_find_label_center_in_row(row_sorted, "DEBITO") is not None and
                 _find_label_center_in_row(row_sorted, "CREDITO") is not None and
                 _find_label_center_in_row(row_sorted, "SALDO")  is not None):
                 continue
 
-            # fecha obligatoria
+            # fecha obligatoria (a la izquierda) + normalización al año de período
             date_txt, left_desc = detect_date_strict(
                 row_sorted, bands,
                 period_year=period_year,
                 start_period=start_period,
                 end_period=end_period
             )
+
             if not date_txt:
+                # continuación: pegar texto y, si aún no hay monto, tomar NO-saldo de la continuación
                 if current and left_desc:
                     extra = " ".join(wtext(w) for w in left_desc).strip()
                     if extra:
                         current["descripcion"] = (current["descripcion"] + " | " + extra).strip()
+                if current and current["debito"] == Decimal("0.00") and current["credito"] == Decimal("0.00"):
+                    side, val = pick_non_saldo_amount(row_sorted, bands)
+                    if side == "debito":  current["debito"]  = val
+                    elif side == "credito": current["credito"] = val
                 continue
 
-            # flush del anterior
+            # flush inmediato para no comer el primero
             if current:
                 movs.append(current)
 
-            # montos → elegir NO-saldo, priorizando Débito; si no, Crédito
-            amts = [a for a in detect_amount_runs(row_sorted) if MONEY_RE.match(a["text"])]
-            by = {"debito": [], "credito": [], "saldo": []}
-            for a in amts:
-                cx = (a["x0"] + a["x1"]) / 2.0
-                by[classify_by_band(cx, bands)].append(a)
-
+            # monto del renglón con fecha: NO-saldo (prioriza débito)
+            side, val = pick_non_saldo_amount(row_sorted, bands)
             deb = cre = Decimal("0.00")
-            pick = None
-            if by["debito"]:
-                pick = sorted(by["debito"], key=lambda a: a["x0"])[0]
-            elif by["credito"]:
-                pick = sorted(by["credito"], key=lambda a: a["x0"])[0]
-            if pick:
-                val = parse_money_es(pick["text"])
-                if pick in by["debito"]: deb = val
-                else: cre = val
-            # todo lo clasificado como "saldo" se ignora siempre
+            if side == "debito":  deb = val
+            elif side == "credito": cre = val
 
             current = {
                 "fecha": date_txt,
@@ -407,3 +435,4 @@ if ok:
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
     st.error("❌ La conciliación NO cierra (±$0,01). Revisá que los montos caigan en la banda correcta y que el PDF no tenga separadores rotos.")
+
